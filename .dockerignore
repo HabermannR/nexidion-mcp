@@ -1,0 +1,10 @@
+# The Dockerfile copies only requirements.txt, server.py, oauth.py.
+# Everything else is context bloat — and .env holds the mcp user's password,
+# which has no business being uploaded to a builder.
+.venv/
+__pycache__/
+.env
+oauth_state.db
+.git/
+.idea/
+*.md
