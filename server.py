@@ -7,8 +7,9 @@ permissions still apply.
 
 Two transports, two identity models:
 
-  stdio (default)  — for Claude Code on the LAN. Signs in as the dedicated `mcp`
-                     service user with a password. All 17 tools, delete included.
+  stdio (default)  — for local MCP clients. Signs in as the configured user, then
+                     exchanges that login for a short-lived actor token carrying
+                     actor_type=mcp. All tools, including delete, are available.
 
   --http           — for claude.ai, which can only reach a remote server and only
                      over OAuth. Each user signs in with their *own* Nexidion
@@ -33,10 +34,21 @@ import time
 import uuid
 import logging
 import pathlib
+import warnings
 from typing import Any
 
 import httpx
+
+# MCP 1.28.1 currently triggers this harmless Pydantic settings warning while
+# resolving FastMCP's forward-referenced lifespan type. It does not affect tool
+# schemas or runtime behavior and would otherwise pollute stdio protocol logs.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Field 'lifespan' has an incomplete definition:.*",
+)
 from mcp.server.fastmcp import FastMCP
+
+__version__ = "1.2.0"
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # keep stdio clean-ish
 
@@ -79,9 +91,10 @@ vault, call find_node_by_title(vault_id, "{INSTRUCTIONS_TITLE}") and follow what
 It takes precedence over these instructions for everything inside that vault. If a
 vault has no such node, proceed normally.
 
-Some nodes are private and will refuse reads or writes. That refusal is deliberate and
-is not a malfunction: do not retry it, and do not route around it via another tool
-(bulk_get_nodes, search, or the version history). Report it to the user and move on.
+Some nodes have inherited access policies. AI-invisible nodes will refuse access;
+quarantined nodes require an explicit include_quarantined=true request from the user;
+write-locked nodes refuse mutations. These decisions are deliberate: do not route
+around them through another tool. Report the policy decision to the user and move on.
 
 Prefer list_nodes(format="tree") to discover node ids: it returns titles and summaries
 without content. Node ids are full 36-character UUIDs and must be passed whole — never
@@ -144,27 +157,39 @@ async def _login(client: httpx.AsyncClient) -> str:
         json={"username": USERNAME, "password": PASSWORD},
     )
     r.raise_for_status()
-    return r.json()["access_token"]
+    human_token = r.json()["access_token"]
+    exchange = await client.post(
+        "/api/auth/actor-token",
+        headers={"Authorization": f"Bearer {human_token}"},
+        json={"actor_type": "mcp"},
+    )
+    exchange.raise_for_status()
+    return exchange.json()["access_token"]
 
 
 SKEW = 60  # the app rejects an `iat` even a second in its future; don't depend on synced clocks
 
 
+def _mcp_token_claims(user_id: str, now: int | None = None) -> dict[str, Any]:
+    """Build the restrictive Nexidion claim set used by HTTP MCP calls."""
+    now = int(time.time()) if now is None else now
+    return {
+        "fresh": False,
+        "iat": now - SKEW,
+        "nbf": now - SKEW,
+        "exp": now + 300,
+        "jti": uuid.uuid4().hex,
+        "type": "access",
+        "sub": str(user_id),
+        "csrf": uuid.uuid4().hex,
+        "actor_type": "mcp",
+    }
+
+
 def _mint_jwt(user_id: str) -> str:
-    """Sign a Nexidion access token for `user_id`, matching the claim shape
-    flask-jwt-extended expects. Short-lived: it is minted per request, never stored."""
-    now = int(time.time())
+    """Sign a five-minute Nexidion actor token for the OAuth-bound user."""
     return pyjwt.encode(
-        {
-            "fresh": False,
-            "iat": now - SKEW,
-            "nbf": now - SKEW,
-            "exp": now + 300,
-            "jti": uuid.uuid4().hex,
-            "type": "access",
-            "sub": str(user_id),
-            "csrf": uuid.uuid4().hex,
-        },
+        _mcp_token_claims(user_id),
         JWT_SECRET_KEY,
         algorithm="HS256",
     )
@@ -222,59 +247,86 @@ async def get_vault(vault_id: int) -> Any:
     return await _request("GET", f"/api/vaults/{vault_id}")
 
 @mcp.tool()
-async def list_nodes(vault_id: int, format: str = "tree") -> Any:
+async def list_nodes(vault_id: int, format: str = "tree", include_quarantined: bool = False) -> Any:
     """List the nodes of a vault. format='tree' (hierarchy: ids, titles, summaries) or
     'list' (flat, and includes the FULL CONTENT of every node — large vaults will
-    overflow the result and get truncated; prefer 'tree' plus get_node)."""
-    return await _request("GET", f"/api/vaults/{vault_id}/nodes/", params={"format": format})
+    overflow the result and get truncated; prefer 'tree' plus get_node).
+    Quarantined subtrees require explicit include_quarantined=true."""
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/", params={
+        "format": format, "include_quarantined": str(include_quarantined).lower(),
+    })
 
 @mcp.tool()
-async def get_node(vault_id: int, node_id: str, version: int | None = None) -> Any:
-    """Get one node's full content. Optional `version` fetches a historical version."""
-    params = {"version": version} if version is not None else None
+async def get_node(vault_id: int, node_id: str, version: int | None = None,
+                   include_quarantined: bool = False) -> Any:
+    """Get one node's full content. Optional `version` fetches a historical version.
+    Quarantined content requires explicit include_quarantined=true."""
+    params: dict[str, Any] = {"include_quarantined": str(include_quarantined).lower()}
+    if version is not None:
+        params["version"] = version
     return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}", params=params)
 
 @mcp.tool()
-async def search(vault_id: int, query: str, limit: int = 20) -> Any:
+async def search(vault_id: int, query: str, limit: int = 20,
+                 include_quarantined: bool = False) -> Any:
     """Full-text search a vault (title + content + AI summary). Best for
     'what does my knowledge base say about X'. limit 1..100."""
     return await _request(
         "GET", f"/api/vaults/{vault_id}/nodes/full-search",
-        params={"q": query, "limit": limit},
+        params={"q": query, "limit": limit,
+                "include_quarantined": str(include_quarantined).lower()},
     )
 
 @mcp.tool()
-async def find_node_by_title(vault_id: int, title: str) -> Any:
+async def find_node_by_title(vault_id: int, title: str,
+                             include_quarantined: bool = False) -> Any:
     """Find a node by (near-)exact title within a vault."""
-    return await _request("GET", f"/api/vaults/{vault_id}/nodes/", params={"title": title})
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/", params={
+        "title": title, "include_quarantined": str(include_quarantined).lower(),
+    })
 
 @mcp.tool()
-async def get_node_versions(vault_id: int, node_id: str) -> Any:
+async def get_node_versions(vault_id: int, node_id: str,
+                            include_quarantined: bool = False) -> Any:
     """List the version history of a node (current full, older as stubs)."""
-    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/versions")
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/versions", params={
+        "include_quarantined": str(include_quarantined).lower(),
+    })
 
 @mcp.tool()
-async def get_version(vault_id: int, node_id: str, version_id: int) -> Any:
+async def get_version(vault_id: int, node_id: str, version_id: int,
+                      include_quarantined: bool = False) -> Any:
     """Load the full content of one historical version of a node."""
-    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/versions/{version_id}")
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/versions/{version_id}", params={
+        "include_quarantined": str(include_quarantined).lower(),
+    })
 
 @mcp.tool()
-async def bulk_get_nodes(vault_id: int, node_ids: list[str]) -> Any:
+async def bulk_get_nodes(vault_id: int, node_ids: list[str],
+                         include_quarantined: bool = False) -> Any:
     """Fetch the current content of several nodes at once by their ids."""
-    return await _request("POST", f"/api/vaults/{vault_id}/nodes/bulk-get", json={"node_ids": node_ids})
+    return await _request("POST", f"/api/vaults/{vault_id}/nodes/bulk-get", json={
+        "node_ids": node_ids, "include_quarantined": include_quarantined,
+    })
 
 @mcp.tool()
-async def list_tasks(vault_id: int, status: str | None = None, limit: int = 20) -> Any:
+async def list_tasks(vault_id: int, status: str | None = None, limit: int = 20,
+                     include_quarantined: bool = False) -> Any:
     """List AI agent tasks for a vault. Optional status: pending/processing/completed/failed."""
-    params: dict[str, Any] = {"vault_id": vault_id, "limit": limit}
+    params: dict[str, Any] = {
+        "vault_id": vault_id, "limit": limit,
+        "include_quarantined": str(include_quarantined).lower(),
+    }
     if status:
         params["status"] = status
     return await _request("GET", "/api/tasks", params=params)
 
 @mcp.tool()
-async def get_task(task_id: str) -> Any:
+async def get_task(task_id: str, include_quarantined: bool = False) -> Any:
     """Get one AI agent task (status, logs, result) by its id."""
-    return await _request("GET", f"/api/tasks/{task_id}")
+    return await _request("GET", f"/api/tasks/{task_id}", params={
+        "include_quarantined": str(include_quarantined).lower(),
+    })
 
 # ================================ WRITE TOOLS ==================================
 @mcp.tool()

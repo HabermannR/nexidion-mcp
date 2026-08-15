@@ -1,4 +1,4 @@
-# nexidion-mcp
+# Nexidion MCP 1.2.0
 
 MCP server that exposes the Nexidion knowledge base as tools. Wraps the REST API —
 no raw SQL — so Nexidion's own auth and per-vault permissions still apply.
@@ -9,8 +9,8 @@ It runs in two modes, with **two different identity models**:
 |---|---|---|
 | Where | your machine, over the LAN | `nexidion-mcp` container on the Pi |
 | Reached at | subprocess on stdin/stdout | `https://mcp.nexidion.org/mcp` |
-| Who it acts as | the shared **`mcp`** service user (id 11) | **the user who logged in**, individually |
-| Auth | password in `.env` | OAuth 2.1 + PKCE (see below) |
+| Who it acts as | the configured Nexidion user | **the user who logged in**, individually |
+| Auth | login followed by an MCP actor-token exchange | OAuth 2.1 + PKCE (see below) |
 | Tools | all 18 | 17 — **no `delete_node`** |
 
 `delete_node` is deliberately not reachable from the public connector: it is
@@ -32,7 +32,9 @@ claude mcp add --scope user nexidion -- \
 Verify: `claude mcp list` / `claude mcp get nexidion`. In a session: `/mcp`.
 **MCP tools load at session start — use a NEW session.**
 
-Self-test against the live API: `.venv/bin/python server.py --selftest`.
+Self-test against an explicitly configured API: `.venv/bin/python server.py --selftest`.
+The login token is immediately exchanged at `/api/auth/actor-token`; all subsequent
+requests carry `actor_type=mcp`, so stdio cannot bypass AI visibility or write policy.
 
 ## HTTP (claude.ai custom connector)
 
@@ -63,6 +65,25 @@ that user has proved their password.
 
 Tokens: access 1 h, refresh 90 days and rotated on every use. Only SHA-256 hashes
 are stored. `whoami` reports which Nexidion user Claude is currently acting as.
+
+Every short-lived Nexidion JWT used for an HTTP or stdio tool call includes the
+trusted `actor_type=mcp` claim. Nexidion therefore retains the user identity for vault
+permissions and auditing while applying inherited node AI-access policies to the
+request. Relevant read tools default to `include_quarantined=false`; explicit opt-in
+never bypasses an AI-invisible policy.
+
+## Tests
+
+Install the pinned runtime and test dependencies in a clean environment, then run:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+The committed tests cover stdio actor-token exchange, HTTP MCP claims, and policy
+option forwarding. `local_smoke_test.py` exercises initialization and authentication
+against an explicitly selected local Nexidion instance.
 
 ### Config (set by compose on the Pi, not by `.env`)
 | var | value |
@@ -102,8 +123,8 @@ Reads + non-destructive writes + `create_task` are allowlisted (`mcp__nexidion__
 ## Admin
 - stdio base URL points at the Pi over the LAN (`http://192.168.178.63:5001`). For
   off-LAN use, switch `NEXIDION_BASE_URL` to `https://caddy.nexidion.org` in `.env`.
-- The `mcp` user has **editor on all 10 vaults**. To revoke a vault, remove its
-  `VaultAccess` row for user 11 (via the app's Admin UI, or the service layer).
-- To rotate the `mcp` password: reset it for user `mcp` and update `.env`.
+- The stdio account has only the vault access assigned in Nexidion. Revoke access
+  through the Admin UI rather than relying on a hard-coded user ID.
+- To rotate the stdio password, reset the configured account and update `.env`.
 - Rotating `JWT_SECRET_KEY` logs everyone out of the app *and* invalidates the
   connector's minted JWTs — restart both containers together.

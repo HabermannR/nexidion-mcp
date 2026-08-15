@@ -1,4 +1,6 @@
 FROM python:3.12-slim
+LABEL org.opencontainers.image.title="Nexidion MCP" \
+      org.opencontainers.image.version="1.2.0"
 
 WORKDIR /app
 
