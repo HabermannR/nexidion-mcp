@@ -16,6 +16,13 @@ It runs in two modes, with **two different identity models**:
 `delete_node` is deliberately not reachable from the public connector: it is
 irreversible, and it is still one Claude Code session away.
 
+> [!IMPORTANT]
+> The AI application you use must itself support MCP and local stdio servers.
+> Running a local LLM API server (for example an OpenAI-compatible model endpoint)
+> is not enough: an LLM API serves model inference, but it does not launch this
+> process, speak MCP, or present MCP tools to the model. Use an MCP-capable client
+> as the application around the model, and configure that client as shown below.
+
 ## Files
 - `server.py` — the tools, plus both transports.
 - `oauth.py` — OAuth authorization server for the HTTP mode (state in SQLite).
@@ -23,16 +30,188 @@ irreversible, and it is still one Claude Code session away.
 - `.env` — stdio config: `NEXIDION_BASE_URL`, `NEXIDION_USER`, `NEXIDION_PASSWORD`
   (chmod 600, git-ignored).
 
-## stdio (Claude Code) — already registered, user scope
+## Fresh stdio installation
+
+These instructions start with a machine that has no checkout or Python environment.
+They configure the local stdio transport, which is the usual choice for desktop MCP
+clients. The Nexidion web application must already be running at a URL this machine
+can reach.
+
+### 1. Prerequisites
+
+Install:
+
+- Git.
+- Python 3.11 or newer, including `venv` and `pip`.
+- An MCP-capable AI client that supports **local stdio servers**. Claude Code is one
+  example. A client that supports only remote HTTP MCP cannot use this local setup.
+
+Check the installations:
+
+```bash
+git --version
+python3 --version
+```
+
+On Windows PowerShell, use `py --version` for Python instead.
+
+### 2. Clone and install on Linux
+
+Choose any permanent directory; the paths used later must match it exactly.
+
+```bash
+git clone https://github.com/HabermannR/nexidion-mcp.git
+cd nexidion-mcp
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+If `python3 -m venv` is unavailable on Debian or Ubuntu, install the distribution's
+`python3-venv` package and repeat the command.
+
+### 3. Clone and install on Windows
+
+In PowerShell:
+
+```powershell
+git clone https://github.com/HabermannR/nexidion-mcp.git
+Set-Location nexidion-mcp
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+If PowerShell blocks `Activate.ps1`, either permit locally created scripts for your
+user (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`) or skip activation and
+run `.\.venv\Scripts\python.exe` explicitly in every command. Activation is only a
+shell convenience; the MCP client configuration below always uses the environment's
+Python executable directly.
+
+### 4. Create and authorize the Nexidion MCP user
+
+The stdio server logs in to Nexidion with a dedicated account. In the Nexidion web
+application:
+
+1. Sign in as an administrator and open **Admin → Users**.
+2. Create a normal, non-administrator user, for example username `mcp`, with a unique
+   password of at least eight characters. Do **not** use or create the special
+   `llm_assistant` account; that account belongs to Nexidion's task runner and cannot
+   log in through the normal authentication endpoint.
+3. Open **Admin → Vaults**, expand **Access** for every vault this connector should
+   use, select the new user, and choose **Add**. Do not grant access to vaults the
+   client should not see.
+
+The account's Nexidion vault permissions remain authoritative. MCP-specific node
+visibility and write policies are also enforced after login.
+
+### 5. Create `.env` from scratch
+
+Create a file named `.env` in the repository root, beside `server.py`:
+
+```dotenv
+NEXIDION_BASE_URL=https://your-nexidion.example.com
+NEXIDION_USER=mcp
+NEXIDION_PASSWORD=replace-with-the-dedicated-users-password
+```
+
+Use the origin of the Nexidion **web application/API**, with no trailing `/api`.
+For example, a LAN install might use `http://192.168.1.20:5001`. Do not put the MCP
+connector URL here. The parser treats everything after `=` literally, so do not add
+quotes or inline comments. Protect the file because it contains a password:
+
+```bash
+chmod 600 .env
+```
+
+On Windows, ensure the file is really named `.env`, not `.env.txt`. It is already
+ignored by Git. You may instead set `NEXIDION_MCP_ENV` to the absolute path of a
+credential file stored elsewhere.
+
+### 6. Verify before configuring a client
+
+From the repository root, with the virtual environment active:
+
+```bash
+python server.py --selftest
+```
+
+A working clean install prints output similar to:
+
+```text
+selftest OK: 3 vaults, user=mcp, base=https://your-nexidion.example.com
+```
+
+The count may differ. Zero vaults normally means the account still needs vault
+access. An authentication error means the username/password is wrong; a connection
+error means `NEXIDION_BASE_URL`, DNS, TLS, a firewall, or the Nexidion service needs
+attention. This test verifies Python, dependencies, `.env`, login, actor-token
+exchange, and API reachability without involving an MCP client.
+
+Do not use `python server.py` as a visual test: a healthy stdio server waits silently
+for MCP protocol messages on standard input.
+
+### 7. Register with Claude Code
+
+Use absolute paths. On Linux:
+
 ```bash
 claude mcp add --scope user nexidion -- \
-  /home/rhab/projects/nexidion-mcp/.venv/bin/python \
-  /home/rhab/projects/nexidion-mcp/server.py
+  /absolute/path/to/nexidion-mcp/.venv/bin/python \
+  /absolute/path/to/nexidion-mcp/server.py
 ```
-Verify: `claude mcp list` / `claude mcp get nexidion`. In a session: `/mcp`.
-**MCP tools load at session start — use a NEW session.**
 
-Self-test against an explicitly configured API: `.venv/bin/python server.py --selftest`.
+On Windows PowerShell (quote paths that may contain spaces):
+
+```powershell
+claude mcp add --scope user nexidion -- `
+  "C:\absolute\path\to\nexidion-mcp\.venv\Scripts\python.exe" `
+  "C:\absolute\path\to\nexidion-mcp\server.py"
+```
+
+Then run `claude mcp list` and `claude mcp get nexidion`. Start a **new Claude Code
+session** because MCP tools are loaded at session startup, run `/mcp`, and ask it to
+call `whoami` and `list_vaults`. The reported user should be `mcp`, and only the
+vaults granted above should appear.
+
+### 8. Generic MCP client JSON
+
+Clients commonly call the configuration property `mcpServers`, although the file
+name and settings location vary by application. Consult your client's documentation
+and confirm that it supports local stdio MCP servers. A Linux entry is:
+
+```json
+{
+  "mcpServers": {
+    "nexidion": {
+      "command": "/absolute/path/to/nexidion-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/nexidion-mcp/server.py"]
+    }
+  }
+}
+```
+
+The Windows equivalent requires doubled backslashes because this is JSON:
+
+```json
+{
+  "mcpServers": {
+    "nexidion": {
+      "command": "C:\\absolute\\path\\to\\nexidion-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\absolute\\path\\to\\nexidion-mcp\\server.py"]
+    }
+  }
+}
+```
+
+Restart the client completely after editing its configuration, then inspect its MCP
+server/tool view and call `whoami` followed by `list_vaults`. Some clients use a
+different schema or require an `env`/working-directory entry; the explicit Python and
+script paths above avoid depending on activation or the working directory. The server
+finds `.env` beside `server.py`.
+
 The login token is immediately exchanged at `/api/auth/actor-token`; all subsequent
 requests carry `actor_type=mcp`, so stdio cannot bypass AI visibility or write policy.
 
@@ -116,9 +295,14 @@ find_node_by_title, get_node_versions, get_version, bulk_get_nodes, list_tasks, 
 Writes: `create_node, update_node, move_node, set_summary, create_task` (queues the
 Nexidion AI agent). `delete_node` (destructive) — **stdio only**.
 
-## Permissions (`~/.claude/settings.json`)
-Reads + non-destructive writes + `create_task` are allowlisted (`mcp__nexidion__*`).
-`delete_node` is in `ask` → always prompts.
+## Claude Code permissions (optional)
+
+Claude Code can apply separate tool-approval rules in its settings. Tool names use
+the `mcp__nexidion__<tool>` form. If you customize those rules, consider allowing
+the read and non-destructive write tools while keeping
+`mcp__nexidion__delete_node` in `ask` because deletion is irreversible. Client-side
+approval rules supplement, but do not replace, Nexidion's account and vault access
+controls.
 
 ## Admin
 - stdio base URL points at the Pi over the LAN (`http://192.168.178.63:5001`). For
