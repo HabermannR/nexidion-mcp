@@ -17,7 +17,9 @@ Tokens are stored only as SHA-256 hashes.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -25,6 +27,8 @@ import time
 from typing import Any
 
 import httpx
+from urllib.parse import urlsplit
+
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
@@ -32,6 +36,7 @@ from mcp.server.auth.provider import (
     AuthorizeError,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    RegistrationError,
     TokenError,
     construct_redirect_uri,
 )
@@ -45,6 +50,33 @@ TXN_TTL = 600  # 10 min to get through the login form
 AUTH_CODE_TTL = 300  # 5 min, single use
 ACCESS_TOKEN_TTL = 3600  # 1 h — Claude silently refreshes
 REFRESH_TOKEN_TTL = 90 * 24 * 3600  # 90 days, rotated on every use
+
+
+# Dynamic client registration is open to anyone, so without this a stranger could
+# register a client whose redirect_uri they control, send a user the /login link,
+# and receive that user's tokens. Only these hosts may receive authorization codes.
+# Loopback is always allowed (local clients such as Claude Code). "*" disables the check.
+DEFAULT_REDIRECT_HOSTS = "claude.ai,claude.com,chatgpt.com"
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def allowed_redirect_hosts() -> set[str] | None:
+    raw = os.environ.get("MCP_ALLOWED_REDIRECT_HOSTS", DEFAULT_REDIRECT_HOSTS).strip()
+    if raw == "*":
+        return None
+    return {host.strip().lower() for host in raw.split(",") if host.strip()}
+
+
+def redirect_uri_allowed(uri: str, allowed: set[str] | None) -> bool:
+    if allowed is None:
+        return True
+    parts = urlsplit(uri)
+    host = (parts.hostname or "").lower()
+    if host in LOOPBACK_HOSTS:
+        return parts.scheme in ("http", "https")
+    if parts.scheme != "https":
+        return False
+    return any(host == entry or host.endswith("." + entry) for entry in allowed)
 
 
 def _hash(token: str) -> str:
@@ -193,6 +225,12 @@ class NexidionOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         return self.store.get_client(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        allowed = allowed_redirect_hosts()
+        for uri in client_info.redirect_uris or []:
+            if not redirect_uri_allowed(str(uri), allowed):
+                raise RegistrationError(
+                    "invalid_redirect_uri",
+                    f"Redirect URI host is not allowed on this server: {urlsplit(str(uri)).hostname}")
         self.store.put_client(client_info)
 
     # --- authorize: park the request, send the human to our login page ---
@@ -328,6 +366,8 @@ _PAGE = """<!doctype html>
 <form method="post" action="/login">
   <h1>Connect Claude to Nexidion</h1>
   <p>Claude will act on your vaults as you, with your permissions.</p>
+  <p>Authorizing <strong>{client}</strong>, which will receive access at <strong>{target}</strong>.
+     Only continue if you started this connection yourself.</p>
   {error}
   <input type="hidden" name="txn" value="{txn}">
   <input name="username" placeholder="Username" autocomplete="username" autofocus required>
@@ -343,10 +383,23 @@ _EXPIRED = """<!doctype html><meta charset="utf-8">
 """
 
 
-def render_login(txn: str, error: str | None = None) -> HTMLResponse:
+def render_login(txn: str, error: str | None = None, client: str = "an MCP client",
+                 target: str = "an unknown address") -> HTMLResponse:
+    fields = {"txn": html.escape(txn, quote=True), "client": html.escape(client),
+              "target": html.escape(target)}
     if error:
-        return HTMLResponse(_PAGE.format(txn=txn, error=f'<p class="err">{error}</p>'), status_code=401)
-    return HTMLResponse(_PAGE.format(txn=txn, error=""))
+        return HTMLResponse(_PAGE.format(error=f'<p class="err">{html.escape(error)}</p>', **fields),
+                            status_code=401)
+    return HTMLResponse(_PAGE.format(error="", **fields))
+
+
+def _describe(provider: "NexidionOAuthProvider", parked: dict[str, Any]) -> dict[str, str]:
+    """Who is asking, for the login page: the client's registered name and the host
+    the authorization code will be sent to."""
+    client = provider.store.get_client(parked.get("client_id", ""))
+    redirect = (parked.get("params") or {}).get("redirect_uri") or ""
+    return {"client": (client.client_name if client and client.client_name else "an MCP client"),
+            "target": urlsplit(str(redirect)).hostname or "an unknown address"}
 
 
 def login_routes(provider: NexidionOAuthProvider):
@@ -354,23 +407,25 @@ def login_routes(provider: NexidionOAuthProvider):
 
     async def get_login(request: Request) -> Response:
         txn = request.query_params.get("txn", "")
-        if not txn or provider.store.peek_txn(txn) is None:
+        parked = provider.store.peek_txn(txn) if txn else None
+        if parked is None:
             return HTMLResponse(_EXPIRED, status_code=400)
-        return render_login(txn)
+        return render_login(txn, **_describe(provider, parked))
 
     async def post_login(request: Request) -> Response:
         form = await request.form()
         txn = str(form.get("txn", ""))
         username = str(form.get("username", ""))
         password = str(form.get("password", ""))
-        if not txn or provider.store.peek_txn(txn) is None:
+        parked = provider.store.peek_txn(txn) if txn else None
+        if parked is None:
             return HTMLResponse(_EXPIRED, status_code=400)
         try:
             redirect, error = await provider.complete_login(txn, username, password)
         except AuthorizeError:
             return HTMLResponse(_EXPIRED, status_code=400)
         if redirect is None:
-            return render_login(txn, error or "Login failed.")
+            return render_login(txn, error or "Login failed.", **_describe(provider, parked))
         return RedirectResponse(redirect, status_code=302)
 
     return get_login, post_login

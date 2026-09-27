@@ -46,9 +46,9 @@ warnings.filterwarnings(
     "ignore",
     message=r"Field 'lifespan' has an incomplete definition:.*",
 )
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # keep stdio clean-ish
 
@@ -97,7 +97,8 @@ write-locked nodes refuse mutations. These decisions are deliberate: do not rout
 around them through another tool. Report the policy decision to the user and move on.
 
 Prefer list_nodes(format="tree") to discover node ids: it returns titles and summaries
-without content. Node ids are full 36-character UUIDs and must be passed whole — never
+without content. search returns verbatim matches: cite those, not ai_summary.
+get_context_bundle loads a node with its links; get_node_asset shows its images. Node ids are full 36-character UUIDs and must be passed whole — never
 abbreviate one, and never reconstruct one from a truncated tool result. If an id looks
 cut off, re-fetch the tree rather than guessing.
 """
@@ -195,9 +196,10 @@ def _mint_jwt(user_id: str) -> str:
     )
 
 
-async def _request(method: str, path: str, **kwargs: Any) -> Any:
+async def _request(method: str, path: str, *, raw: bool = False, **kwargs: Any) -> Any:
     """Make an authenticated request. Returns parsed JSON (or a {'ok': True, ...}
-    dict for empty bodies), or raises with the API error.
+    dict for empty bodies), or raises with the API error. With raw=True returns
+    (body bytes, content type) instead, for binary responses such as images.
 
     In HTTP mode the call is made as the OAuth-authenticated user; in stdio mode as
     the shared `mcp` service user, re-logging in once on a 401."""
@@ -225,6 +227,8 @@ async def _request(method: str, path: str, **kwargs: Any) -> Any:
             except Exception:
                 detail = r.text
             raise RuntimeError(f"Nexidion API {r.status_code}: {detail}")
+        if raw:
+            return r.content, r.headers.get("content-type", "")
         if not r.content:
             return {"ok": True, "status": r.status_code}
         return r.json()
@@ -267,15 +271,31 @@ async def get_node(vault_id: int, node_id: str, version: int | None = None,
     return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}", params=params)
 
 @mcp.tool()
-async def search(vault_id: int, query: str, limit: int = 20,
+async def search(vault_id: int, query: str, limit: int = 20, snippet_length: int = 600,
+                 max_snippets: int = 3, include_content: bool = False,
+                 include_summary: bool = True, subtree_root_id: str | None = None,
+                 content_kind: str | None = None, authority: str | None = None,
                  include_quarantined: bool = False) -> Any:
-    """Full-text search a vault (title + content + AI summary). Best for
-    'what does my knowledge base say about X'. limit 1..100."""
-    return await _request(
-        "GET", f"/api/vaults/{vault_id}/nodes/full-search",
-        params={"q": query, "limit": limit,
-                "include_quarantined": str(include_quarantined).lower()},
-    )
+    """Full-text search a vault (title + content + AI summary), ranked.
+
+    Each hit carries `matches`: verbatim passages from the node's CURRENT content with
+    start_char/end_char, heading_path and version. Treat those as the evidence and the
+    ai_summary only as a navigation aid — it may be stale or interpretive. When
+    `summary_only` is true the node matched through its summary alone; read the node
+    before relying on it. Full node content is omitted unless include_content=true.
+    Optional filters: subtree_root_id, content_kind, authority. limit 1..100."""
+    params: dict[str, Any] = {
+        "q": query, "limit": limit, "snippets": "true",
+        "snippet_length": snippet_length, "max_snippets": max_snippets,
+        "include_content": str(include_content).lower(),
+        "include_summary": str(include_summary).lower(),
+        "include_quarantined": str(include_quarantined).lower(),
+    }
+    for key, value in (("subtree_root_id", subtree_root_id), ("content_kind", content_kind),
+                       ("authority", authority)):
+        if value:
+            params[key] = value
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/full-search", params=params)
 
 @mcp.tool()
 async def find_node_by_title(vault_id: int, title: str,
@@ -308,6 +328,73 @@ async def bulk_get_nodes(vault_id: int, node_ids: list[str],
     return await _request("POST", f"/api/vaults/{vault_id}/nodes/bulk-get", json={
         "node_ids": node_ids, "include_quarantined": include_quarantined,
     })
+
+@mcp.tool()
+async def list_node_assets(vault_id: int, node_id: str, include_quarantined: bool = False) -> Any:
+    """List the images embedded in a node (current content and summary), in document
+    order: asset_id, alt_text, caption, mime_type, dimensions, byte size, source page.
+    Fetch one with get_node_asset to actually see it."""
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/assets", params={
+        "include_quarantined": str(include_quarantined).lower(),
+    })
+
+@mcp.tool()
+async def get_node_asset(vault_id: int, node_id: str, asset_id: str, max_px: int = 1024,
+                         include_quarantined: bool = False) -> Image:
+    """Return an image embedded in a node so you can look at it. The image is
+    downscaled so its longer side is at most max_px (64..2048). Only assets the node
+    currently embeds are reachable, under that node's access policy."""
+    data, content_type = await _request(
+        "GET", f"/api/vaults/{vault_id}/nodes/{node_id}/assets/{asset_id}", raw=True,
+        params={"representation": "preview", "max_px": max(64, min(int(max_px), 2048)),
+                "include_quarantined": str(include_quarantined).lower()})
+    return Image(data=data, format="jpeg" if "jpeg" in content_type else "png")
+
+@mcp.tool()
+async def get_context_bundle(vault_id: int, node_id: str, depth: int = 1,
+                             include_parent: bool = True, include_children: bool = True,
+                             include_outlinks: bool = True, include_backlinks: bool = True,
+                             include_content: str = "snippets", snippet_chars: int = 1200,
+                             include_summaries: bool = True, max_items: int = 30,
+                             max_chars: int = 30000, include_quarantined: bool = False) -> Any:
+    """Load a node together with its graph neighbourhood in one call: parent, children,
+    [[wiki-link]] outlinks and backlinks, breadth-first up to `depth` (max 3).
+
+    Every item says how it was reached (relation, distance, relation_from), which
+    version it is, whether its summary is current, and — for links — the text around
+    the link (link_context). Content is original text: include_content = none |
+    snippets (first snippet_chars of each node) | full, within a total max_chars
+    budget. No synthesis is done: which node is right is yours to judge. `truncated`
+    and `omitted_count` say when the limits cut something off."""
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/{node_id}/context", params={
+        "depth": depth, "include_parent": str(include_parent).lower(),
+        "include_children": str(include_children).lower(),
+        "include_outlinks": str(include_outlinks).lower(),
+        "include_backlinks": str(include_backlinks).lower(),
+        "include_content": include_content, "snippet_chars": snippet_chars,
+        "include_summaries": str(include_summaries).lower(),
+        "max_items": max_items, "max_chars": max_chars,
+        "include_quarantined": str(include_quarantined).lower(),
+    })
+
+@mcp.tool()
+async def search_context_bundle(vault_id: int, query: str, seed_limit: int = 5, depth: int = 1,
+                                max_items: int = 30, max_chars: int = 30000,
+                                include_content: str = "snippets", subtree_root_id: str | None = None,
+                                include_quarantined: bool = False) -> Any:
+    """Answer 'read everything relevant to X' in one call: search for up to seed_limit
+    seed nodes (with their verbatim matches), then add each seed's parent, children,
+    outlinks and backlinks up to `depth`. Seeds have relation 'seed'; every other item
+    says which node reached it and how. Bounded by max_items/max_chars; `truncated`
+    says when something was cut. Nothing is summarised — you do the synthesis."""
+    params: dict[str, Any] = {
+        "q": query, "seed_limit": seed_limit, "depth": depth, "max_items": max_items,
+        "max_chars": max_chars, "include_content": include_content,
+        "include_quarantined": str(include_quarantined).lower(),
+    }
+    if subtree_root_id:
+        params["subtree_root_id"] = subtree_root_id
+    return await _request("GET", f"/api/vaults/{vault_id}/nodes/context-search", params=params)
 
 @mcp.tool()
 async def list_tasks(vault_id: int, status: str | None = None, limit: int = 20,

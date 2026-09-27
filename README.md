@@ -1,4 +1,4 @@
-# Nexidion MCP 1.2.0
+# Nexidion MCP 1.3.0
 
 MCP server that exposes the Nexidion knowledge base as tools. Wraps the REST API —
 no raw SQL — so Nexidion's own auth and per-vault permissions still apply.
@@ -11,7 +11,7 @@ It runs in two modes, with **two different identity models**:
 | Reached at | subprocess on stdin/stdout | `https://mcp.nexidion.org/mcp` |
 | Who it acts as | the configured Nexidion user | **the user who logged in**, individually |
 | Auth | login followed by an MCP actor-token exchange | OAuth 2.1 + PKCE (see below) |
-| Tools | all 18 | 17 — **no `delete_node`** |
+| Tools | all 22 | 21 — **no `delete_node`** |
 
 `delete_node` is deliberately not reachable from the public connector: it is
 irreversible, and it is still one Claude Code session away.
@@ -283,6 +283,11 @@ docker buildx imagetools inspect rhabermann/nexidion-mcp:vN --format '{{.Manifes
 ssh rhab@192.168.178.63 'cd ~/nexidion && docker compose pull mcp && docker compose up -d --no-deps mcp'
 ```
 
+Only clients whose redirect URIs are on allowed hosts may register
+(`MCP_ALLOWED_REDIRECT_HOSTS`, default `claude.ai,claude.com,chatgpt.com`; loopback is
+always allowed; `*` disables the check). Add a host there before connecting another
+web client.
+
 Wiping `nexidion_mcp-state` forces every connector to re-authorize — that is the
 kill switch if a token ever leaks:
 ```bash
@@ -292,6 +297,16 @@ docker compose rm -sf mcp && docker volume rm nexidion_mcp-state && docker compo
 ## Tools
 Reads: `whoami, list_vaults, get_vault, list_nodes, get_node, search (full-text),
 find_node_by_title, get_node_versions, get_version, bulk_get_nodes, list_tasks, get_task`.
+
+Agent-native retrieval (needs a Nexidion build that has the matching endpoints):
+- `search` returns verbatim `matches` from each hit's current content (offsets,
+  heading path, version) and flags `summary_only` hits; full content is omitted
+  unless `include_content=true`.
+- `list_node_assets` / `get_node_asset` list and return the images a node embeds,
+  as real image content, under that node's access policy.
+- `get_context_bundle` loads a node with its parent, children, outlinks and
+  backlinks in one bounded call, each with relation, distance and link context.
+- `search_context_bundle` does the same starting from a search query's top hits.
 Writes: `create_node, update_node, move_node, set_summary, create_task` (queues the
 Nexidion AI agent). `delete_node` (destructive) — **stdio only**.
 
